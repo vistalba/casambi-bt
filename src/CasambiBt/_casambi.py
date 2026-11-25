@@ -21,7 +21,7 @@ from ._client import (
     ConnectionState,
 )
 from ._constants import isClassicNetwork, normalizeAddress
-from ._network import Network
+from ._network import Network, NetworkAdditions
 from ._operation import (
     OpCode,
     OperationsContext,
@@ -203,6 +203,20 @@ class Casambi:
         network = cast(Network, self._casaNetwork)
         await network.logIn(password)
         return await network.fetchUpdate()
+
+    async def applyNetworkAdditions(self) -> NetworkAdditions | None:
+        """Apply a configuration downloaded by `refreshNetwork` while connected.
+
+        This only works if the new configuration adds units, groups or scenes
+        and changes nothing else. The objects already in use stay the same.
+
+        :return: The added units, groups and scenes, or None if the
+            configuration has other changes. It is then applied by the next
+            connect.
+        :raises ConnectionStateError: There is no network loaded.
+        """
+        self._checkNetwork()
+        return await cast(Network, self._casaNetwork).applyAdditions()
 
     @property
     def networkRevision(self) -> int:

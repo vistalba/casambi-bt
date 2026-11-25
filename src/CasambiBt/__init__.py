@@ -5,6 +5,7 @@ from ._cache import CACHE_VERSION
 from ._casambi import Casambi
 from ._constants import normalizeAddress
 from ._discover import discover
+from ._network import NetworkAdditions
 from ._switch import ButtonEventType, SwitchEvent
 from ._unit import (
     ColorSource,
@@ -45,6 +46,7 @@ __all__ = [
     "ColorSource",
     "ConnectionStateError",
     "Group",
+    "NetworkAdditions",
     "NetworkNotFoundError",
     "NetworkOnlineUpdateNeededError",
     "NetworkUpdateError",

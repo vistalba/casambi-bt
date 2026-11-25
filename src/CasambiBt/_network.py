@@ -59,6 +59,30 @@ class _NetworkSession:
         return datetime.now(UTC) > self.expires
 
 
+@dataclass(frozen=True)
+class NetworkAdditions:
+    """Units, groups and scenes added to the configuration in use."""
+
+    units: list[Unit]
+    groups: list[Group]
+    scenes: list[Scene]
+
+
+def _unitIdentity(unit: Unit) -> tuple[object, ...]:
+    return (
+        unit.deviceId,
+        unit.uuid,
+        unit.address,
+        unit.name,
+        unit.firmwareVersion,
+        unit._typeId,
+    )
+
+
+def _groupIdentity(group: Group) -> tuple[object, ...]:
+    return (group.groudId, group.name, tuple(u.deviceId for u in group.units))
+
+
 class Network:
     def __init__(self, uuid: str, httpClient: AsyncClient, cache: Cache) -> None:
         self._session: _NetworkSession | None = None
@@ -71,6 +95,8 @@ class Network:
         self.units: list[Unit] = []
         self.groups: list[Group] = []
         self.scenes: list[Scene] = []
+        # The configuration that units, groups and scenes were built from.
+        self._appliedNetwork: dict[str, Any] | None = None
 
         self._logger = logging.getLogger(__name__)
 
@@ -411,59 +437,9 @@ class Network:
                 netJson.get("managerKey"),
             )
 
-            units: list[Unit] = []
-            for u in netJson["units"]:
-                typeId = int(u["type"])
-                uType = await self._fetchUnitInfo(typeId, forceOffline)
-                if uType is None:
-                    self._logger.warning(
-                        "Type %i of unit %s is unknown. Keeping the unit without controls.",
-                        typeId,
-                        u["deviceID"],
-                    )
-                    uType = unknownUnitType(typeId)
-                units.append(
-                    Unit(
-                        typeId,
-                        int(u["deviceID"]),
-                        str(u["uuid"]),
-                        str(u["address"]),
-                        str(u["name"]),
-                        str(u["firmware"]),
-                        uType,
-                        _isClassic=isClassicNetwork(protocolVersion),
-                    )
-                )
-
-            groups: list[Group] = []
-            for c in netJson["grid"]["cells"]:
-                # Only one type at top level is currently supported
-                if c["type"] != 2:
-                    continue
-
-                # Parse group members, we assume no nested groups here
-                group_units = []
-                for subC in c["cells"]:
-                    # Ignore everyting that isn't a unit
-                    if subC["type"] != 1:
-                        continue
-
-                    unitMatch = [u for u in units if u.deviceId == subC["unit"]]
-                    if len(unitMatch) != 1:
-                        self._logger.warning(
-                            "Inconsistent unit reference to %s in group %s. Got %i matches.",
-                            subC["unit"],
-                            c["groupID"],
-                            len(unitMatch),
-                        )
-                        continue
-                    group_units.append(unitMatch[0])
-
-                groups.append(Group(int(c["groupID"]), str(c["name"]), group_units))
-
-            scenes = [
-                Scene(int(s["sceneID"]), str(s["name"])) for s in netJson["scenes"]
-            ]
+            units, groups, scenes = await self._buildConfiguration(
+                netJson, protocolVersion, forceOffline
+            )
         except (KeyError, TypeError, ValueError) as err:
             raise NetworkUpdateError("Malformed network configuration.") from err
 
@@ -473,8 +449,156 @@ class Network:
         self.units = units
         self.groups = groups
         self.scenes = scenes
+        self._appliedNetwork = network
 
         await self._saveTypeCache()
+
+    async def _buildConfiguration(
+        self, netJson: dict[str, Any], protocolVersion: int, forceOffline: bool
+    ) -> tuple[list[Unit], list[Group], list[Scene]]:
+        """Build the units, groups and scenes of a network configuration.
+
+        :raises KeyError, TypeError, ValueError: The configuration is malformed.
+        """
+        units: list[Unit] = []
+        for u in netJson["units"]:
+            typeId = int(u["type"])
+            uType = await self._fetchUnitInfo(typeId, forceOffline)
+            if uType is None:
+                self._logger.warning(
+                    "Type %i of unit %s is unknown. Keeping the unit without controls.",
+                    typeId,
+                    u["deviceID"],
+                )
+                uType = unknownUnitType(typeId)
+            units.append(
+                Unit(
+                    typeId,
+                    int(u["deviceID"]),
+                    str(u["uuid"]),
+                    str(u["address"]),
+                    str(u["name"]),
+                    str(u["firmware"]),
+                    uType,
+                    _isClassic=isClassicNetwork(protocolVersion),
+                )
+            )
+
+        groups: list[Group] = []
+        for c in netJson["grid"]["cells"]:
+            # Only one type at top level is currently supported
+            if c["type"] != 2:
+                continue
+
+            # Parse group members, we assume no nested groups here
+            group_units = []
+            for subC in c["cells"]:
+                # Ignore everyting that isn't a unit
+                if subC["type"] != 1:
+                    continue
+
+                unitMatch = [u for u in units if u.deviceId == subC["unit"]]
+                if len(unitMatch) != 1:
+                    self._logger.warning(
+                        "Inconsistent unit reference to %s in group %s. Got %i matches.",
+                        subC["unit"],
+                        c["groupID"],
+                        len(unitMatch),
+                    )
+                    continue
+                group_units.append(unitMatch[0])
+
+            groups.append(Group(int(c["groupID"]), str(c["name"]), group_units))
+
+        scenes = [Scene(int(s["sceneID"]), str(s["name"])) for s in netJson["scenes"]]
+        return units, groups, scenes
+
+    async def applyAdditions(self) -> NetworkAdditions | None:
+        """Apply a newer cached configuration if it only adds to the network.
+
+        Units, groups and scenes that are new in the configuration downloaded
+        by `fetchUpdate` are added to the configuration in use. The objects
+        already in use stay the same, so references to them stay valid.
+
+        :return: The added units, groups and scenes, or None if anything else
+            changed (e.g. a unit was removed or renamed, or the keys changed).
+            Such a configuration is applied by the next connect.
+        """
+        fresh = await self._readCachedNetwork()
+        applied = self._appliedNetwork
+        if fresh is None or applied is None:
+            return None
+        freshJson, appliedJson = fresh["network"], applied["network"]
+        if int(freshJson["revision"]) == self._networkRevision:
+            return NetworkAdditions([], [], [])
+        for key in ("name", "protocolVersion", "keyStore", "visitorKey", "managerKey"):
+            if freshJson.get(key) != appliedJson.get(key):
+                self._logger.debug("Network %s changed, can't apply live.", key)
+                return None
+
+        try:
+            units, groups, scenes = await self._buildConfiguration(
+                freshJson, self._protocolVersion, False
+            )
+        except (KeyError, TypeError, ValueError, NetworkUpdateError):
+            # E.g. a malformed configuration or a unit type the cloud didn't
+            # deliver. The next connect handles it like any other update.
+            self._logger.warning("Can't apply the network update live.", exc_info=True)
+            return None
+
+        liveUnits = {u.deviceId: u for u in self.units}
+        if not liveUnits.keys() <= {u.deviceId for u in units}:
+            return None
+        if any(
+            _unitIdentity(u) != _unitIdentity(liveUnits[u.deviceId])
+            for u in units
+            if u.deviceId in liveUnits
+        ):
+            return None
+        newUnits = [u for u in units if u.deviceId not in liveUnits]
+        allUnits = {**{u.deviceId: u for u in newUnits}, **liveUnits}
+
+        liveGroups = {g.groudId: g for g in self.groups}
+        if not liveGroups.keys() <= {g.groudId for g in groups}:
+            return None
+        if any(
+            _groupIdentity(g) != _groupIdentity(liveGroups[g.groudId])
+            for g in groups
+            if g.groudId in liveGroups
+        ):
+            return None
+        # Groups of the configuration in use must reference the units in use.
+        newGroups = [
+            Group(g.groudId, g.name, [allUnits[u.deviceId] for u in g.units])
+            for g in groups
+            if g.groudId not in liveGroups
+        ]
+
+        liveScenes = {sc.sceneId: sc for sc in self.scenes}
+        if not liveScenes.keys() <= {sc.sceneId for sc in scenes}:
+            return None
+        if any(
+            sc.name != liveScenes[sc.sceneId].name
+            for sc in scenes
+            if sc.sceneId in liveScenes
+        ):
+            return None
+        newScenes = [sc for sc in scenes if sc.sceneId not in liveScenes]
+
+        self.units.extend(newUnits)
+        self.groups.extend(newGroups)
+        self.scenes.extend(newScenes)
+        self._networkRevision = int(freshJson["revision"])
+        self._appliedNetwork = fresh
+        await self._saveTypeCache()
+        self._logger.info(
+            "Added %i units, %i groups and %i scenes of revision %i.",
+            len(newUnits),
+            len(newGroups),
+            len(newScenes),
+            self._networkRevision,
+        )
+        return NetworkAdditions(newUnits, newGroups, newScenes)
 
     async def _fetchUnitInfo(
         self, id: int, forceOffline: bool = False

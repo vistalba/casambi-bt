@@ -46,7 +46,10 @@ needs the cloud.
 - `connect(..., preferCache=True)` uses the cached configuration without
   contacting the cloud. Use `refreshNetwork(password)` afterwards to check for
   a newer configuration; it is stored in the cache and used by the next
-  connect.
+  connect. If it only adds units, groups or scenes,
+  `applyNetworkAdditions()` applies it to the running connection and returns
+  the added objects. Objects already in use stay the same. For any other
+  change it returns `None` and the configuration is used by the next connect.
 - Without `preferCache` the cloud is asked first. Any cloud error other than a
   rejected password (maintenance, rate limits, no internet) falls back to the
   cache. Unit types are kept beyond their expiry while the cloud is
