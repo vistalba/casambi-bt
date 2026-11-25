@@ -341,3 +341,74 @@ async def test_exchange_key_fails_after_max_retries(client):
         await client.exchangeKey(retries=2)
 
     assert client._gattClient.read_gatt_char.call_count == 3
+
+
+def test_on_disconnect_updates_state_before_callback(client, disconnected_callback):
+    client._connectionState = ConnectionState.AUTHENTICATED
+    states: list[ConnectionState] = []
+    disconnected_callback.side_effect = lambda: states.append(client._connectionState)
+
+    client._on_disconnect(MagicMock())
+
+    disconnected_callback.assert_called_once()
+    assert states == [ConnectionState.NONE]
+
+
+async def test_disconnect_when_link_already_down(client):
+    client._connectionState = ConnectionState.AUTHENTICATED
+    client._gattClient = AsyncMock()
+    client._gattClient.is_connected = False
+
+    await client.disconnect()
+
+    client._gattClient.disconnect.assert_awaited_once()
+    assert client._connectionState == ConnectionState.NONE
+
+
+async def test_send_on_lost_link_with_other_wording_raises_connection_state_error(
+    client,
+):
+    client._connectionState = ConnectionState.AUTHENTICATED
+    client._gattClient = AsyncMock()
+    client._gattClient.is_connected = False
+    client._nonce = b"1234567890123456"
+    client._encryptor = MagicMock()
+    client._encryptor.encryptThenMac.return_value = b"encrypted_payload"
+    client._gattClient.write_gatt_char.side_effect = BleakError(
+        "Casambi Network - 00:11:22:33:44:55 is not connected"
+    )
+
+    with pytest.raises(ConnectionStateError):
+        await client.send(b"\x01\x02")
+
+    assert client._connectionState == ConnectionState.NONE
+
+
+async def test_send_timeout_on_lost_link_raises_connection_state_error(client):
+    client._connectionState = ConnectionState.AUTHENTICATED
+    client._gattClient = AsyncMock()
+    client._gattClient.is_connected = False
+    client._nonce = b"1234567890123456"
+    client._encryptor = MagicMock()
+    client._encryptor.encryptThenMac.return_value = b"encrypted_payload"
+    client._gattClient.write_gatt_char.side_effect = TimeoutError
+
+    with pytest.raises(ConnectionStateError):
+        await client.send(b"\x01\x02")
+
+    assert client._connectionState == ConnectionState.NONE
+
+
+async def test_send_timeout_on_live_link_is_kept(client):
+    client._connectionState = ConnectionState.AUTHENTICATED
+    client._gattClient = AsyncMock()
+    client._gattClient.is_connected = True
+    client._nonce = b"1234567890123456"
+    client._encryptor = MagicMock()
+    client._encryptor.encryptThenMac.return_value = b"encrypted_payload"
+    client._gattClient.write_gatt_char.side_effect = TimeoutError
+
+    with pytest.raises(TimeoutError):
+        await client.send(b"\x01\x02")
+
+    assert client._connectionState == ConnectionState.AUTHENTICATED

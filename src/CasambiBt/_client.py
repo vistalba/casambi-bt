@@ -165,12 +165,25 @@ class CasambiClient(ABC):
         self._connectionState = ConnectionState.CONNECTED
 
     def _on_disconnect(self, client: BleakClient) -> None:
-        if self._connectionState != ConnectionState.NONE:
+        previousState = self._connectionState
+        if previousState != ConnectionState.NONE:
             self._logger.info(f"Received disconnect callback from {self.address}")
-        if self._connectionState == ConnectionState.AUTHENTICATED:
+        # Update the state before notifying anyone. Consumers might start a
+        # reconnect from the callback and must not see a stale connection.
+        self._connectionState = ConnectionState.NONE
+        if previousState == ConnectionState.AUTHENTICATED:
             self._logger.debug("Executing disconnect callback.")
             self._disconnectedCallback()
-        self._connectionState = ConnectionState.NONE
+
+    def _linkLost(self, err: BaseException) -> bool:
+        """Return whether a failed GATT operation was caused by a lost link.
+
+        Backends word this error differently, e.g. ESPHome proxies report
+        "<device> is not connected", so also check the client itself.
+        """
+        if err.args and err.args[0] == "Not connected":
+            return True
+        return self._gattClient is not None and not self._gattClient.is_connected
 
     def _queueCallback(
         self, handle: BleakGATTCharacteristic, data: bytes | bytearray
@@ -281,10 +294,13 @@ class CasambiClient(ABC):
                     await self._callbackTask
             self._callbackTask = None
 
-        if self._gattClient is not None and self._gattClient.is_connected:
+        # Always disconnect, even if the link is already down. Otherwise the
+        # backend can keep stale state (e.g. BlueZ notify sessions) that
+        # makes the key exchange of the next connection time out.
+        if self._gattClient is not None:
             try:
                 await self._gattClient.disconnect()
-            except BleakError:
+            except (BleakError, TimeoutError):
                 self._logger.debug("Failed to disconnect BleakClient.", exc_info=True)
 
         self._connectionState = ConnectionState.NONE
@@ -660,8 +676,8 @@ class CasambiClientEvolution(CasambiClient):
         encPacket = self._encryptor.encryptThenMac(packet, self._getNonce(id))
         try:
             await self._gattClient.write_gatt_char(char, encPacket)
-        except BleakError as e:
-            if e.args and e.args[0] == "Not connected":
+        except (BleakError, TimeoutError) as e:
+            if self._linkLost(e):
                 self._logger.debug(
                     "Unexpected write while disconnected.", exc_info=True
                 )
@@ -669,6 +685,8 @@ class CasambiClientEvolution(CasambiClient):
                 raise ConnectionStateError(
                     ConnectionState.AUTHENTICATED, ConnectionState.NONE
                 ) from e
+            if isinstance(e, TimeoutError):
+                raise
             raise BluetoothError from e
 
     def _getNonce(self, id: int | bytes) -> bytes:
@@ -894,8 +912,8 @@ class CasambiClientClassic(CasambiClient):
 
         try:
             await self._gattClient.write_gatt_char(CASA_AUTH_CHAR_UUID, outPacket)
-        except BleakError as e:
-            if e.args and e.args[0] == "Not connected":
+        except (BleakError, TimeoutError) as e:
+            if self._linkLost(e):
                 self._logger.debug(
                     "Unexpected write while disconnected.", exc_info=True
                 )
@@ -903,4 +921,6 @@ class CasambiClientClassic(CasambiClient):
                 raise ConnectionStateError(
                     ConnectionState.AUTHENTICATED, ConnectionState.NONE
                 ) from e
+            if isinstance(e, TimeoutError):
+                raise
             raise BluetoothError from e

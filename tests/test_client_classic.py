@@ -216,6 +216,25 @@ async def test_send_internal_not_connected_raises_connection_state_error(client)
     assert client._connectionState == ConnectionState.NONE
 
 
+async def test_send_internal_lost_link_with_other_wording_raises_connection_state_error(
+    client,
+):
+    client._connectionState = ConnectionState.AUTHENTICATED
+    client._gattClient = AsyncMock()
+    client._gattClient.is_connected = False
+    client._connhash = b"12345678"
+    client._managerEncryptor = MagicMock()
+    client._managerEncryptor.digest.return_value = b"encrypted_packet"
+    client._gattClient.write_gatt_char.side_effect = BleakError(
+        "Casambi Network - 00:11:22:33:44:55 is not connected"
+    )
+
+    with pytest.raises(ConnectionStateError):
+        await client._sendInternal(b"\x12\x34")
+
+    assert client._connectionState == ConnectionState.NONE
+
+
 async def test_sendInternal_visitor(
     mock_network_no_manager, data_callback, disconnected_callback
 ):
